@@ -81,6 +81,7 @@ def convert_nodes(context, graph):
     """
     for node in _tqdm(graph.nodes, desc="Converting PyTorch Frontend ==> MIL Ops", unit=" ops"):
         op_lookup = node.kind
+        # print(op_lookup)
         if op_lookup.endswith("_"):
             # This is an "in place" op.
             # Look up the standard op instead by removing underscore.
@@ -422,22 +423,6 @@ def outer(context, node):
     context.add(res)
 
 @register_torch_op
-def cross(context, node):
-    inputs = _get_inputs(context, node, expected=3)
-    x = inputs[0]
-    y = inputs[1]
-    dim = inputs[2]
-
-    x1 = mb.gather(x=x, indices=[1, 2, 0], axis=dim, name="x1")
-    x2 = mb.gather(x=x, indices=[2, 0, 1], axis=dim, name="x2")
-    y1 = mb.gather(x=y, indices=[1, 2, 0], axis=dim, name="y1")
-    y2 = mb.gather(x=y, indices=[2, 0, 1], axis=dim, name="y2")
-    m1 = mb.mul(x=x1, y=y2)
-    m2 = mb.mul(x=x2, y=y1)
-    z = mb.sub(x=m1, y=m2, name=node.name)
-    context.add(z)
-
-@register_torch_op
 def frobenius_norm(context, node):
     x, dim, keep_dims = _get_inputs(context, node, expected=3)
     result = mb.reduce_l2_norm(x=x, axes=dim, keep_dims=keep_dims, name=node.name)
@@ -467,7 +452,7 @@ def _vector_norm(x, order, dim, keep_dims, name):
         temp = mb.abs(x=x)
         temp = mb.reduce_min(x=temp, axes=dim, keep_dims=keep_dims, name=name)
     else:
-        # sum(abs(x)^{order})^{(1 / order)}
+        # sum(abs(x)^{ord})^{(1 / ord)}
         temp = mb.abs(x=x)
         x, y = promote_input_dtypes([temp, order.val])
         temp = mb.pow(x=x, y=y)
@@ -533,7 +518,7 @@ def linalg_norm(context, node):
     if order is None:
         temp = mb.reduce_l2_norm(x=x, axes=dim, keep_dims=keep_dims, name=node.name)
     elif len(dim)==2:
-        temp = _matrix_norm(x=x, order=order, dim=dim, keep_dims=keep_dims, name=node.name)  
+        temp = _matrix_norm(x=x, order=order, dim=dim, keep_dims=keep_dims, name=node.name)
     else:
         temp = _vector_norm(x=x, order=order, dim=dim, keep_dims=keep_dims, name=node.name)
     context.add(temp)
@@ -1324,12 +1309,7 @@ def sub(context, node):
 def mean(context, node):
     inputs = _get_inputs(context, node)
 
-    x = inputs[0]
-    if types.is_bool(x.dtype):
-        # TODO: In the future when MIL op supports bool, we need to use curr_opset_version to decide
-        # if we want to cast or not.
-        x = mb.cast(x=x, dtype="fp32")
-    kwargs = {"x": x, "name": node.name}
+    kwargs = {"x": inputs[0], "name": node.name}
 
     # @axes is optional, so omit if None.
     axes = inputs[1]
@@ -1636,32 +1616,6 @@ def batch_norm(context, node):
 
 
 @register_torch_op
-def _weight_norm(context, node):
-    v, g, dim = _get_inputs(context, node, expected=3)
-
-    # Determine axes for L2 norm
-    if dim.val == -1:
-        axes = None
-    else:
-        axes = list(range(v.rank))
-        dim = dim.val
-        if dim >= 0:
-            axes.remove(dim)
-        else:
-            axes.remove(v.rank + dim)
-
-    # Calculate L2 norm of v
-    temp = mb.pow(x=v, y=2.)
-    temp = mb.reduce_sum(x=temp, axes=axes, keep_dims=True)
-    norm = mb.pow(x=temp, y=1./2)
-
-    inverse_norm = mb.inverse(x=norm)
-    direction = mb.mul(x=v, y=inverse_norm)
-    result = mb.mul(x=g, y=direction, name=node.name)
-    context.add(result)
-
-
-@register_torch_op
 def instance_norm(context, node):
     inputs = _get_inputs(context, node, expected=9)
     x = inputs[0]
@@ -1685,29 +1639,21 @@ def group_norm(context, node):
     num_groups = inputs[1].val
     weight = inputs[2]
     bias = inputs[3]
-    eps = inputs[4] 
-    n,c = x.shape[0],x.shape[1] # at minimum (N, C) required
-    input_shape = [*x.shape] # n, c, *
+    eps = inputs[4]
+    n,c,t = x.shape[0], x.shape[1], x.shape[2]
+    t = -1 if any_symbolic(t) else t
     num_groups = builtins.min(num_groups,c)
-    new_shape = [n, num_groups, c//num_groups]
-    new_shape += [*x.shape[2:]] # adds remaining dims
-    num_extra_axes = len(x.shape[2:])
-    axes_ = [int(i) for i in range(2, 2 + num_extra_axes + 1)]
-    weight_shape, bias_shape = [1,c], [1,c]
-    weight_shape += [1 for _ in range(num_extra_axes)]
-    bias_shape += [1 for _ in range(num_extra_axes)]
-    
-    x = mb.reshape(x=x, shape=new_shape)
-    mean = mb.reduce_mean(x=x, axes=axes_, keep_dims=True)
-    var = _std(x,axes_,True,False,eps.val)
+    x = mb.reshape(x=x, shape=[n,num_groups,c//num_groups,t])
+    mean = mb.reduce_mean(x=x, axes=[2,3], keep_dims=True)
+    var = _std(x,[2,3],True,False,eps.val)
     x = mb.sub(x=x,y=mean)
     x = mb.real_div(x=x,y=var)
-    x = mb.reshape(x=x, shape=input_shape)
+    x = mb.reshape(x=x, shape=[n,c,t])
     if weight is not None:
-        weight = mb.reshape(x=weight, shape=weight_shape)
+        weight = mb.reshape(x=weight, shape=[1,c,1])
         x = mb.mul(x=x,y=weight)
     if bias is not None:
-        bias = mb.reshape(x=bias, shape=bias_shape)
+        bias = mb.reshape(x=bias, shape=[1,c,1])
         x = mb.add(x=x,y=bias)
     context.add(x,node.name)
 
@@ -2526,9 +2472,9 @@ def lstm(context, node):
 def _get_scales_from_output_size(output_size, input_shape):
     scales = []
     if output_size is not None:
-        # output_size will be either 
+        # output_size will be either
         # (1) A list of Var, and each Var indicates the output size for that dimension
-        # (2) A single Var which indicates the whole output size 
+        # (2) A single Var which indicates the whole output size
         # (3) A numpy array
 
         if isinstance(output_size, list):
@@ -2541,7 +2487,7 @@ def _get_scales_from_output_size(output_size, input_shape):
         # output size is computed using the formula floor (scale * input_size) in Core ML (and PyTorch).
         # Thus, when computing the scales from the output size, we add a small positive constant to the output size
         # to make sure that the floor formula results in the correct output size and not 1 unit smaller.
-        # For instance, if output size = 5 and input size = 2, then scale will be 2.5, which can get 
+        # For instance, if output size = 5 and input size = 2, then scale will be 2.5, which can get
         # represented as 2.49999 due to float precision issues, and this might resultin an output size of 4
         # instead of 5, without the epsilon correction.
 
@@ -2552,7 +2498,7 @@ def _get_scales_from_output_size(output_size, input_shape):
             scales_h = Hout / Hin if Hout % Hin == 0 else (Hout + 1e-4) / Hin
             scales = scales_h
         elif len(output_size) == 2:
-            # 2d upsampling 
+            # 2d upsampling
             Hout, Wout = output_size[0], output_size[1]
             Hin, Win = input_shape[-2], input_shape[-1]
             scales_h = Hout / Hin if Hout % Hin == 0 else (Hout + 1e-4) / Hin
@@ -2712,7 +2658,7 @@ def upsample_nearest1d(context, node):
     if scale is not None and scale.val is not None and scale.shape == (1,):
         # Get the scale factor from provided inputs
         # This happens when recompute_scale_factor = False
-        scale_factor = scale.val[0]  
+        scale_factor = scale.val[0]
 
     elif isinstance(output_size, list):
         # When the input shape is dynamic and recompute_scale_factor = True,
@@ -3389,16 +3335,6 @@ def new_full(context, node):
     context.add(result)
 
 @register_torch_op
-def randint(context, node):
-    inputs = _get_inputs(context, node, expected=8)
-    low = mb.cast(x=inputs[0], dtype="fp32")
-    high = mb.cast(x=inputs[1], dtype="fp32")
-    shape = inputs[2]
-    rand_uniform = mb.random_uniform(shape=shape, low=low, high=high)
-    rand_int = mb.cast(x=rand_uniform, dtype="int32", name=node.name)
-    context.add(rand_int)
-
-@register_torch_op
 def bitwise_not(context, node):
     inputs = _get_inputs(context, node)
     x = inputs[0]
@@ -3771,30 +3707,13 @@ def _broadcast(name, tensor, shape):
 
 @register_torch_op
 def expand(context, node):
-    def _broadcast_dynamic(name, tensor, shape):
-        # Add any extra dimensions
-        if len(shape) > tensor.rank:
-            new_dims = len(shape) - tensor.rank
-            tensor = mb.expand_dims(x=tensor, axes=list(range(new_dims)))
-
-        tensor_shape = mb.shape(x=tensor)
-        shape = mb.concat(values=shape, axis=0)
-        reps = mb.real_div(x=shape, y=tensor_shape)
-        reps = mb.cast(x=reps, dtype="int32")
-        res = mb.tile(x=tensor, reps=reps, name=name)
-        return res
-
-
     # PyTorch 1.6+ has 3 inputs while older version has 2
     inputs = _get_inputs(context, node, expected=[2, 3])
 
     x = inputs[0]
-    shape = inputs[1]
+    shape = inputs[1].val
 
-    if isinstance(shape, list):
-        res = _broadcast_dynamic(node.name, x, shape)
-    else:
-        res = _broadcast(node.name, x, shape.val)
+    res = _broadcast(node.name, x, shape)
     context.add(res)
 
 
@@ -3948,9 +3867,6 @@ def argmax(context, node):
     x = inputs[0]
     axis = inputs[1]
     keep_dims = inputs[2]
-    if types.is_int(x.dtype) and x.dtype._width == 64:
-        # MIL reduce_argmax doesn't support int64.
-        x = mb.cast(x=x, dtype="int32")
     res = mb.reduce_argmax(x=x, axis=axis, keep_dims=keep_dims, name=node.name)
     context.add(res)
 
@@ -4025,18 +3941,10 @@ def dim(context, node):
 def min(context, node):
     inputs = _get_inputs(context, node)
 
-    # mimic functionality from https://pytorch.org/docs/stable/generated/torch.min.html
-    if len(inputs) == 1:
-        value = mb.reduce_min(x=inputs[0], axes=None, name=node.name)
-        context.add(value)
-    elif len(inputs) == 2 and inputs[0].shape == inputs[1].shape:
-        value = mb.minimum(x=inputs[0], y=inputs[1], name=node.name)
-        context.add(value)
-    else:
-        assert(len(inputs) <= 3)
+    if len(inputs) == 3:
         _input = inputs[0]
         dim = inputs[1].val
-        keepdim = inputs[2].val if len(inputs) == 3 else False
+        keepdim = inputs[2].val
 
         values = mb.reduce_min(x=_input, axes=[dim], keep_dims=keepdim)
         indices = mb.reduce_argmin(x=_input, axis=dim, keep_dims=keepdim)
@@ -4045,24 +3953,19 @@ def min(context, node):
         indices_name = node.outputs[1]
         context.add(values, torch_name=values_name)
         context.add(indices, torch_name=indices_name)
-
+    else:
+        assert(len(inputs) == 1)
+        value = mb.reduce_min(x=inputs[0], axes=None, name=node.name)
+        context.add(value)
 
 @register_torch_op
 def max(context, node):
     inputs = _get_inputs(context, node)
 
-    # mimic functionality from https://pytorch.org/docs/stable/generated/torch.max.html
-    if len(inputs) == 1:
-        value = mb.reduce_max(x=inputs[0], axes=None, name=node.name)
-        context.add(value)
-    elif len(inputs) == 2 and inputs[0].shape == inputs[1].shape:
-        value = mb.maximum(x=inputs[0], y=inputs[1], name=node.name)
-        context.add(value)
-    else:
-        assert(len(inputs) <= 3)
+    if len(inputs) == 3:
         _input = inputs[0]
         dim = inputs[1].val
-        keepdim = inputs[2].val if len(inputs) == 3 else False
+        keepdim = inputs[2].val
 
         values = mb.reduce_max(x=_input, axes=[dim], keep_dims=keepdim)
         indices = mb.reduce_argmax(x=_input, axis=dim, keep_dims=keepdim)
@@ -4071,7 +3974,10 @@ def max(context, node):
         indices_name = node.outputs[1]
         context.add(values, torch_name=values_name)
         context.add(indices, torch_name=indices_name)
-
+    else:
+        assert(len(inputs) == 1)
+        value = mb.reduce_max(x=inputs[0], axes=None, name=node.name)
+        context.add(value)
 
 @register_torch_op
 def argsort(context, node):
@@ -4140,11 +4046,9 @@ def _abs(context, node):
 def repeat(context, node):
     x = context[node.inputs[0]]
     reps = context[node.inputs[1]]
-    if isinstance(reps, list):
-        reps = mb.concat(values=reps, axis=0)
 
-    if reps.shape[0] > len(x.shape):
-        x = mb.expand_dims(x=x, axes=list(range(reps.shape[0] - x.rank)))
+    if len(reps.val) > len(x.shape):
+        x = mb.expand_dims(x=x, axes=list(range(len(reps.val) - x.rank)))
     context.add(mb.tile(x=x, reps=reps, name=node.name))
 
 @register_torch_op
@@ -4358,34 +4262,9 @@ def logical_xor(context, node):
     y = mb.cast(x=y, dtype="bool")
     context.add(mb.logical_xor(x=x, y=y, name=node.name))
 
-
-def _nonzero_as_tuple(context, node, x):
-    '''
-    Calculates the non-zero elements of x then slices results by each inner index.
-    '''
-    non_zero = mb.non_zero(x=x)
-
-    result = []
-    for i in range(x.rank):
-        result.append(mb.slice_by_index(x=non_zero,
-                                        begin=[0, i],
-                                        end=[-1, -1], # Ignored, but required
-                                        end_mask=[True, False],
-                                        squeeze_mask=[False, True])
-        )
-
-    context.add(result, node.name)
-
-
 @register_torch_op
 def where(context, node):
-    inputs = _get_inputs(context, node)
-
-    if len(inputs) == 1:
-        _nonzero_as_tuple(context, node, inputs[0])
-        return
-
-    assert len(inputs) == 3
+    inputs = _get_inputs(context, node, expected=3)
     cond = inputs[0]
     if not types.is_bool(cond.dtype):
         # cond must be bool type
@@ -4398,13 +4277,6 @@ def where(context, node):
         result = mb.select(cond=cond, a=inputs[1], b=inputs[2], name=node.name)
     context.add(result)
 
-
-@register_torch_op
-def nonzero_numpy(context, node):
-    inputs = _get_inputs(context, node, expected=1)
-    _nonzero_as_tuple(context, node, inputs[0])
-
-
 @register_torch_op
 def neg(context, node):
     inputs = _get_inputs(context, node, expected=1)
@@ -4412,6 +4284,54 @@ def neg(context, node):
     context.add(mb.mul(x=x, y=y, name=node.name))
 
 
+
+@register_torch_op
+def glu(context, node):
+    """
+    glu(Tensor input, Scalar dim=-1)
+    Applies the gated linear unit function GLU(a,b)=a⊗σ(b) where a is the first half of the input matrices and b is the
+    second half.
+    """
+    assert len(node.outputs) == 1
+    inputs = _get_inputs(context, node, expected=2)
+    input, axis = inputs
+
+    first_half, second_half = mb.split(x=input, num_splits=2, axis=axis.val, name=node.name + "_split")
+    context.add(first_half)
+    context.add(second_half)
+
+    sigmoid_second_half = mb.sigmoid(x=second_half, name=second_half.name + "_sigmoid")
+    context.add(sigmoid_second_half)
+
+    glu_node = mb.mul(x=first_half, y=sigmoid_second_half, name=node.name)
+    context.add(glu_node)
+
+
+@register_torch_op
+def hann_window(context, node):
+    inputs = _get_inputs(context, node, expected=[5, 6])
+    if inputs[0].val is None:
+        raise NotImplementedError("variable 'window_length' not supported.")
+
+    #if len(inputs) == 6:
+    #   raise NotImplementedError("'periodic' not supported.")
+    size = (inputs[0].val,)
+    if inputs[0].val <= 1:
+        one = mb.fill(shape=size, value=1.0, name=node.name)
+        context.add(one)
+        return
+    ones = mb.fill(shape=size, value=1.0)
+    cum = mb.cumsum(x=ones, axis=0)
+    seq = mb.sub(x=cum, y=ones)
+    pi = mb.fill(shape=size, value=_math.pi)
+    window_length_float = mb.cast(x=inputs[0], dtype="fp32")
+    denominator = mb.fill(shape=size, value=window_length_float)
+    numerator = mb.mul(x=seq, y=pi)
+    frac = mb.real_div(x=numerator, y=denominator)
+    sin = mb.sin(x=frac)
+    sin_sq = mb.mul(x=sin, y=sin, name=node.name)
+    context.add(sin_sq)
+    
 @register_torch_op
 def topk(context, node):
     inputs = _get_inputs(context, node)
@@ -4700,7 +4620,7 @@ def _pad_packed_sequence(context, node):
 
     # transpose the tensor if batch_first = False
     if not batch_first:
-        x = mb.stack(values=total_tensor, axis=0)
+        x = x = mb.stack(values=total_tensor, axis=0)
         x = mb.transpose(x=x, perm=[1,0,2], name=node.name)
     else:
         x = mb.stack(values=total_tensor, axis=0, name=node.name)
@@ -4784,8 +4704,6 @@ def _scatter(context, inputs, mode, name):
     axis = inputs[1].val
     indices = inputs[2]
     updates = inputs[3]
-    if types.is_scalar(updates.sym_type):
-        updates = mb.fill(shape=indices.shape, value=updates.val, name=name)
     result = mb.scatter_along_axis(data=data, indices=indices, updates=updates,
                                    axis=axis, mode=mode, name=name)
     context.add(result)
@@ -4813,140 +4731,3 @@ def scatter(context, node):
 def scatter_add(context, node):
     inputs = _get_inputs(context, node)
     _scatter(context, inputs, 'add', node.name)
-
-
-@register_torch_op
-def baddbmm(context, node):
-    """
-    baddbmm(Tensor input, Tensor batch1, Tensor batch2, Scalar beta=1, Scalar alpha=1)
-    output = beta * input + alpha * batch1 * batch2
-
-    Notice that batch1 and batch2 must be 3-D tensors each containing the same number of matrices.
-    If batch1 is a (b×n×m) tensor, batch2 is a (b×m×p) tensor, then input must be broadcastable with a (b×n×p) tensor
-    and out will be a (b×n×p) tensor.
-    """
-    assert len(node.outputs) == 1
-    inputs = _get_inputs(context, node, expected=5)
-    bias, batch1, batch2, beta, alpha = inputs
-
-    if beta.val != 1.0:
-        # Apply scaling factor beta to the bias.
-        bias = mb.mul(x=beta, y=bias, name=bias.name + "_scaled")
-        context.add(bias)
-
-    if alpha.val != 1.0:
-        # Apply scaling factor alpha to the input.
-        batch1 = mb.mul(x=alpha, y=batch1, name=batch1.name + "_scaled")
-        context.add(batch1)
-
-    bmm_node = mb.matmul(x=batch1, y=batch2, name=node.name + "_bmm")
-    context.add(bmm_node)
-
-    baddbmm_node = mb.add(x=bias, y=bmm_node, name=node.name)
-    context.add(baddbmm_node)
-
-
-@register_torch_op
-def glu(context, node):
-    """
-    glu(Tensor input, Scalar dim=-1)
-    Applies the gated linear unit function GLU(a,b)=a⊗σ(b) where a is the first half of the input matrices and b is the
-    second half.
-    """
-    assert len(node.outputs) == 1
-    inputs = _get_inputs(context, node, expected=2)
-    input, axis = inputs
-
-    first_half, second_half = mb.split(x=input, num_splits=2, axis=axis.val, name=node.name + "_split")
-    context.add(first_half)
-    context.add(second_half)
-
-    sigmoid_second_half = mb.sigmoid(x=second_half, name=second_half.name + "_sigmoid")
-    context.add(sigmoid_second_half)
-
-    glu_node = mb.mul(x=first_half, y=sigmoid_second_half, name=node.name)
-    context.add(glu_node)
-
-
-@register_torch_op
-def hstack(context, node):
-    """
-    hstack(List[Tensor] tensors, Optional[Tensor] out)
-    Stack tensors in sequence horizontally (column wise). This is equivalent to concatenation along the first axis for
-    1-D tensors, and along the second axis for all other tensors.
-    """
-    inputs = _get_inputs(context, node)
-    tensors = inputs[0]
-    input_shapes = [list(x.shape) for x in tensors]
-    # Concatenates along the first axis for 1-D tensors, and along the second axis for all other tensors.
-    axis = 0 if len(input_shapes[0]) == 1 else 1
-    hstack_node = mb.concat(values=tensors, axis=axis, name=node.name)
-    context.add(hstack_node)
-
-
-@register_torch_op
-def remainder(context, node):
-    """
-    remainder(Tensor dividend, Tensor divisor, Optional[Tensor] out)
-    Computes Python’s modulus operation entrywise. The result has the same sign as the divisor and its absolute value
-    is less than that of divisor. It may also be defined in terms of torch.div() as:
-    remainder(a, b) == a - a.div(b, rounding_mode="floor") * b
-    """
-    # Don't specify `expected` because the parameter `out` is optional.
-    inputs = _get_inputs(context, node)
-    dividend, divisor = inputs[0], inputs[1]
-    div_node = mb.floor_div(x=dividend, y=divisor, name=node.name + "_div")
-    context.add(div_node)
-    scaled_div = mb.mul(x=div_node, y=divisor, name=div_node.name + "_scaled")
-    context.add(scaled_div)
-    remainder_node = mb.sub(x=dividend, y=scaled_div, name=node.name)
-    context.add(remainder_node)
-
-
-@register_torch_op
-def hann_window(context, node):
-    inputs = _get_inputs(context, node, expected=[5, 6])
-    if inputs[0].val is None:
-        raise NotImplementedError("variable 'window_length' not supported.")
-
-    periodic = True
-    if len(inputs) == 6:
-        if inputs[1].val is None:
-            raise NotImplementedError("variable 'periodic' not supported.")
-        if not inputs[1].val:
-            periodic = False
-
-    size = (inputs[0].val,)
-    if inputs[0].val <= 1:
-        one = mb.fill(shape=size, value=1.0, name=node.name)
-        context.add(one)
-        return
-
-    ones = mb.fill(shape=size, value=1.0)
-    cum = mb.cumsum(x=ones, axis=0)
-    seq = mb.sub(x=cum, y=ones)
-    pi = mb.fill(shape=size, value=_math.pi)
-    window_length_float = mb.cast(x=inputs[0], dtype="fp32")
-    if not periodic:
-        window_length_float = mb.sub(x=window_length_float, y=ones)
-    denominator = mb.fill(shape=size, value=window_length_float)
-    numerator = mb.mul(x=seq, y=pi)
-    frac = mb.real_div(x=numerator, y=denominator)
-    sin = mb.sin(x=frac)
-    sin_sq = mb.mul(x=sin, y=sin, name=node.name)
-    context.add(sin_sq)
-
-
-@register_torch_op
-def trace(context, node):
-    inputs = _get_inputs(context, node, expected=1)
-    x = inputs[0]
-    dims = mb.shape(x=x)
-    dim0 = _value_at(dims, 0)
-    dim1 = _value_at(dims, 1)
-    min_dim = mb.minimum(x=dim0, y=dim1)
-    indices = mb.range_1d(end=min_dim, start=0, step=1)
-    indices = mb.stack(values=[indices, indices], axis=1)
-    diagonal = mb.gather_nd(x=x, indices=indices)
-    trace = mb.reduce_sum(x=diagonal, name=node.name)
-    context.add(trace)
